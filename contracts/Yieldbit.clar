@@ -6,17 +6,32 @@
 (define-constant ERR_HARVEST_NOT_VERIFIED (err u105))
 (define-constant ERR_SEASON_NOT_ACTIVE (err u106))
 (define-constant ERR_INVALID_SEASON (err u107))
+(define-constant ERR_POLICY_NOT_FOUND (err u108))
+(define-constant ERR_POLICY_EXPIRED (err u109))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u110))
+(define-constant ERR_INSUFFICIENT_PREMIUM (err u111))
+(define-constant ERR_INVALID_CLAIM_AMOUNT (err u112))
+(define-constant ERR_POLICY_ALREADY_EXISTS (err u113))
+(define-constant ERR_CLAIM_PERIOD_EXPIRED (err u114))
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant TOKEN_NAME "Yieldbit")
 (define-constant TOKEN_SYMBOL "YBT")
 (define-constant TOKEN_DECIMALS u6)
 (define-constant BLOCKS_PER_SEASON u52560)
+(define-constant INSURANCE_POOL_FEE u50)
+(define-constant BLOCKS_PER_YEAR u210240)
+(define-constant MAX_COVERAGE_PERCENTAGE u80)
+(define-constant MIN_PREMIUM_RATE u10)
+(define-constant CLAIM_PROCESSING_BLOCKS u1440)
 
 (define-data-var total-supply uint u0)
 (define-data-var current-season uint u1)
 (define-data-var season-start-block uint u0)
 (define-data-var total-verified-yield uint u0)
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var total-policies-issued uint u0)
+(define-data-var total-claims-paid uint u0)
 
 (define-map token-balances principal uint)
 (define-map token-allowances {owner: principal, spender: principal} uint)
@@ -56,6 +71,36 @@
 
 (define-map harvest-counters principal uint)
 
+(define-map insurance-policies
+    {farmer: principal, policy-id: uint}
+    {
+        coverage-amount: uint,
+        premium-paid: uint,
+        crop-type: (string-ascii 50),
+        start-block: uint,
+        end-block: uint,
+        active: bool,
+        claims-made: uint
+    }
+)
+
+(define-map insurance-claims
+    {farmer: principal, policy-id: uint, claim-id: uint}
+    {
+        loss-amount: uint,
+        claim-amount: uint,
+        loss-type: (string-ascii 50),
+        submitted-block: uint,
+        processed: bool,
+        approved: bool,
+        payout-amount: uint,
+        processor: (optional principal)
+    }
+)
+
+(define-map policy-counters principal uint)
+(define-map claim-counters {farmer: principal, policy-id: uint} uint)
+
 (define-read-only (get-name)
     (ok TOKEN_NAME)
 )
@@ -94,6 +139,26 @@
 
 (define-read-only (get-season-stats (season uint))
     (map-get? season-stats season)
+)
+
+(define-read-only (get-insurance-policy (farmer principal) (policy-id uint))
+    (map-get? insurance-policies {farmer: farmer, policy-id: policy-id})
+)
+
+(define-read-only (get-insurance-claim (farmer principal) (policy-id uint) (claim-id uint))
+    (map-get? insurance-claims {farmer: farmer, policy-id: policy-id, claim-id: claim-id})
+)
+
+(define-read-only (get-insurance-pool-balance)
+    (ok (var-get insurance-pool-balance))
+)
+
+(define-read-only (get-total-policies-issued)
+    (ok (var-get total-policies-issued))
+)
+
+(define-read-only (get-total-claims-paid)
+    (ok (var-get total-claims-paid))
 )
 
 (define-read-only (is-season-active)
@@ -235,6 +300,126 @@
     )
 )
 
+(define-public (purchase-insurance (coverage-amount uint) (crop-type (string-ascii 50)) (duration-blocks uint))
+    (let ((farmer tx-sender)
+          (policy-counter (default-to u0 (map-get? policy-counters farmer)))
+          (new-policy-id (+ policy-counter u1))
+          (premium-amount (calculate-premium coverage-amount duration-blocks))
+          (farmer-balance (default-to u0 (map-get? token-balances farmer))))
+        (asserts! (> coverage-amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= duration-blocks (* BLOCKS_PER_SEASON u1)) ERR_INVALID_AMOUNT)
+        (asserts! (<= duration-blocks BLOCKS_PER_YEAR) ERR_INVALID_AMOUNT)
+        (asserts! (is-some (map-get? farmers farmer)) ERR_NOT_FOUND)
+        (asserts! (>= farmer-balance premium-amount) ERR_INSUFFICIENT_BALANCE)
+        (asserts! (is-none (map-get? insurance-policies {farmer: farmer, policy-id: new-policy-id})) ERR_POLICY_ALREADY_EXISTS)
+        
+        (unwrap! (burn-tokens farmer premium-amount) ERR_NOT_FOUND)
+        (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) premium-amount))
+        
+        (map-set policy-counters farmer new-policy-id)
+        (map-set insurance-policies {farmer: farmer, policy-id: new-policy-id} {
+            coverage-amount: coverage-amount,
+            premium-paid: premium-amount,
+            crop-type: crop-type,
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height duration-blocks),
+            active: true,
+            claims-made: u0
+        })
+        
+        (var-set total-policies-issued (+ (var-get total-policies-issued) u1))
+        (ok new-policy-id)
+    )
+)
+
+(define-public (submit-insurance-claim (policy-id uint) (loss-amount uint) (loss-type (string-ascii 50)))
+    (let ((farmer tx-sender)
+          (policy-key {farmer: farmer, policy-id: policy-id})
+          (policy-data (unwrap! (map-get? insurance-policies policy-key) ERR_POLICY_NOT_FOUND))
+          (claim-counter (default-to u0 (map-get? claim-counters policy-key)))
+          (new-claim-id (+ claim-counter u1))
+          (max-claim-amount (/ (* (get coverage-amount policy-data) MAX_COVERAGE_PERCENTAGE) u100)))
+        (asserts! (get active policy-data) ERR_POLICY_EXPIRED)
+        (asserts! (< stacks-block-height (get end-block policy-data)) ERR_POLICY_EXPIRED)
+        (asserts! (> loss-amount u0) ERR_INVALID_CLAIM_AMOUNT)
+        (asserts! (<= loss-amount max-claim-amount) ERR_INVALID_CLAIM_AMOUNT)
+        
+        (map-set claim-counters policy-key new-claim-id)
+        (map-set insurance-claims {farmer: farmer, policy-id: policy-id, claim-id: new-claim-id} {
+            loss-amount: loss-amount,
+            claim-amount: (min loss-amount max-claim-amount),
+            loss-type: loss-type,
+            submitted-block: stacks-block-height,
+            processed: false,
+            approved: false,
+            payout-amount: u0,
+            processor: none
+        })
+        
+        (map-set insurance-policies policy-key 
+            (merge policy-data {claims-made: (+ (get claims-made policy-data) u1)}))
+        
+        (ok new-claim-id)
+    )
+)
+
+(define-public (process-insurance-claim (farmer principal) (policy-id uint) (claim-id uint) (approve-claim bool))
+    (let ((processor tx-sender)
+          (claim-key {farmer: farmer, policy-id: policy-id, claim-id: claim-id})
+          (claim-data (unwrap! (map-get? insurance-claims claim-key) ERR_NOT_FOUND))
+          (policy-data (unwrap! (map-get? insurance-policies {farmer: farmer, policy-id: policy-id}) ERR_POLICY_NOT_FOUND)))
+        (asserts! (or (is-eq processor CONTRACT_OWNER) (is-farmer-verified processor)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get processed claim-data)) ERR_CLAIM_ALREADY_PROCESSED)
+        (asserts! (< (- stacks-block-height (get submitted-block claim-data)) CLAIM_PROCESSING_BLOCKS) ERR_CLAIM_PERIOD_EXPIRED)
+        
+        (if approve-claim
+            (let ((payout-amount (get claim-amount claim-data)))
+                (asserts! (>= (var-get insurance-pool-balance) payout-amount) ERR_INSUFFICIENT_BALANCE)
+                (unwrap! (mint-tokens farmer payout-amount) ERR_NOT_FOUND)
+                (var-set insurance-pool-balance (- (var-get insurance-pool-balance) payout-amount))
+                (var-set total-claims-paid (+ (var-get total-claims-paid) payout-amount))
+                
+                (map-set insurance-claims claim-key 
+                    (merge claim-data {
+                        processed: true,
+                        approved: true,
+                        payout-amount: payout-amount,
+                        processor: (some processor)
+                    }))
+                (ok payout-amount)
+            )
+            (begin
+                (map-set insurance-claims claim-key 
+                    (merge claim-data {
+                        processed: true,
+                        approved: false,
+                        payout-amount: u0,
+                        processor: (some processor)
+                    }))
+                (ok u0)
+            )
+        )
+    )
+)
+
+(define-public (cancel-insurance-policy (policy-id uint))
+    (let ((farmer tx-sender)
+          (policy-key {farmer: farmer, policy-id: policy-id})
+          (policy-data (unwrap! (map-get? insurance-policies policy-key) ERR_POLICY_NOT_FOUND)))
+        (asserts! (get active policy-data) ERR_POLICY_EXPIRED)
+        (asserts! (< stacks-block-height (get end-block policy-data)) ERR_POLICY_EXPIRED)
+        (asserts! (is-eq (get claims-made policy-data) u0) ERR_CLAIM_ALREADY_PROCESSED)
+        
+        (let ((refund-amount (/ (get premium-paid policy-data) u2)))
+            (map-set insurance-policies policy-key 
+                (merge policy-data {active: false}))
+            (unwrap! (mint-tokens farmer refund-amount) ERR_NOT_FOUND)
+            (var-set insurance-pool-balance (- (var-get insurance-pool-balance) refund-amount))
+            (ok refund-amount)
+        )
+    )
+)
+
 (define-private (mint-tokens (recipient principal) (amount uint))
     (let ((current-balance (default-to u0 (map-get? token-balances recipient))))
         (map-set token-balances recipient (+ current-balance amount))
@@ -243,8 +428,25 @@
     )
 )
 
+(define-private (burn-tokens (account principal) (amount uint))
+    (let ((current-balance (default-to u0 (map-get? token-balances account))))
+        (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+        (map-set token-balances account (- current-balance amount))
+        (var-set total-supply (- (var-get total-supply) amount))
+        (ok true)
+    )
+)
+
 (define-private (calculate-tokens-for-yield (yield-amount uint))
     (* yield-amount u100)
+)
+
+(define-private (calculate-premium (coverage-amount uint) (duration-blocks uint))
+    (let ((base-rate MIN_PREMIUM_RATE)
+          (duration-factor (/ duration-blocks BLOCKS_PER_SEASON))
+          (coverage-factor (/ coverage-amount u1000000)))
+        (+ (* coverage-amount base-rate duration-factor) (* coverage-factor u100))
+    )
 )
 
 (define-private (is-farmer-verified (farmer principal))
@@ -293,3 +495,6 @@
 (define-private (max (a uint) (b uint))
     (if (>= a b) a b)
 )
+
+
+
